@@ -54,23 +54,6 @@
     image.onload = () => URL.revokeObjectURL(uri);
     preview.appendChild(image);
   });
-  const editForm = document.querySelector('#activityForm');
-  document.querySelectorAll('.activity-edit').forEach(button => button.addEventListener('click', () => {
-    if (!editForm) return;
-    document.querySelector('#activityId').value = button.dataset.id;
-    document.querySelector('#activityTitle').value = button.dataset.title;
-    document.querySelector('#activityTarget').value = button.dataset.target;
-    document.querySelector('#activityProgress').value = button.dataset.progress;
-    document.querySelector('#activityFormTitle').textContent = 'Update activity progress';
-    editForm.scrollIntoView({behavior:'smooth',block:'center'});
-    document.querySelector('#activityTitle').focus({preventScroll:true});
-  }));
-  document.querySelector('#activityReset')?.addEventListener('click', () => {
-    if (!editForm) return;
-    editForm.reset();
-    document.querySelector('#activityId').value = '0';
-    document.querySelector('#activityFormTitle').textContent = 'Add an activity';
-  });
   document.querySelectorAll('.copy-code').forEach(button => button.addEventListener('click', async () => {
     const code = button.dataset.copy;
     if (!code) return;
@@ -83,7 +66,6 @@
       window.prompt('Copy your project code:', code);
     }
   }));
-  // Project evidence carousel + full-resolution, zoomable viewer.
   const evidenceTrack = document.querySelector('#projectEvidenceCarousel');
   evidenceTrack?.closest('.content-card')?.querySelector('.gallery-scroll-back')?.addEventListener('click', () => {
     evidenceTrack.scrollBy({left: -Math.max(240, evidenceTrack.clientWidth * 0.8), behavior: 'smooth'});
@@ -166,6 +148,35 @@
     viewer.addEventListener('click', event => {if (event.target === viewer) viewer.close();});
     viewer.addEventListener('close', () => {fullImage.removeAttribute('src'); resetZoom();});
   }
+  const ownerActivity = document.getElementById('ownerActivity');
+  const ownerActivityProject = document.getElementById('ownerActivityProject');
+  if (ownerActivity && ownerActivityProject) {
+    const updateProject = () => {
+      const option = ownerActivity.selectedOptions[0];
+      ownerActivityProject.value = option?.dataset.project || '';
+    };
+    ownerActivity.addEventListener('change', updateProject);
+    updateProject();
+  }
   const focus = new URLSearchParams(location.search).get('focus');
   if (focus && /^\d+$/.test(focus)) document.getElementById(`evidence-${focus}`)?.scrollIntoView({block:'center'});
+  if (document.body.dataset.role === 'client' && document.querySelector('[data-live-section]')) {
+    const sections = Array.from(document.querySelectorAll('[data-live-section]'));
+    let busy = false;
+    setInterval(async () => {
+      if (busy || document.hidden || document.querySelector('dialog[open]') || document.activeElement?.matches('input, textarea, select')) return;
+      busy = true;
+      try {
+        const response = await fetch(window.location.href, {cache:'no-store',credentials:'same-origin',headers:{'X-Requested-With':'ProjectLens-Refresh'}});
+        if (!response.ok) return;
+        const page = new DOMParser().parseFromString(await response.text(), 'text/html');
+        for (const section of sections) {
+          if (!section.isConnected) continue;
+          const next = page.querySelector('[data-live-section="'+section.dataset.liveSection+'"]');
+          if (next && section.innerHTML !== next.innerHTML) section.innerHTML = next.innerHTML;
+        }
+      } catch (error) { }
+      finally {busy = false;}
+    }, 30000);
+  }
 })();

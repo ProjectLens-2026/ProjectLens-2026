@@ -1,17 +1,19 @@
 <?php
 declare(strict_types=1);
 require_once __DIR__.'/inc/core.php';
-auth();
+auth(['super_admin','manager','client']);
 if($_SERVER['REQUEST_METHOD']!=='POST') {http_response_code(405);exit('Use report export on your dashboard.');}
 ensure_csrf();
 $pid=(int)($_POST['project_id']??0);$p=project($pid);
 if(!$p){http_response_code(403);exit('You do not have access to this project.');}
 $type=(string)($_POST['report_type']??'summary');$format=(string)($_POST['format']??'pdf');$ai=isset($_POST['include_ai']);
 if(!in_array($type,['summary','full','audit'],true)||!in_array($format,['pdf','docx','xlsx'],true)){http_response_code(400);exit('Invalid export format or report type.');}
-$activities=all('SELECT * FROM activities WHERE project_id=? ORDER BY id',[$pid]);
-$evidence=all('SELECT e.*,a.title activity_name FROM evidence e JOIN activities a ON a.id=e.activity_id WHERE e.project_id=? ORDER BY e.id',[$pid]);
+$activities=all('SELECT * FROM activities WHERE project_id=? AND deleted_at IS NULL ORDER BY id',[$pid]);
+$evidence=all('SELECT e.*,a.title activity_name FROM evidence e JOIN activities a ON a.id=e.activity_id AND a.deleted_at IS NULL WHERE e.project_id=?'.(role()==='client'?" AND e.review_status='approved'":'').' ORDER BY e.id',[$pid]);
+$financial=project_finance($pid);
+$transactions=all('SELECT * FROM project_finances WHERE project_id=?'.(role()==='client'?" AND approval_status='approved'":'').' ORDER BY entry_date,id',[$pid]);
 $approved=count(array_filter($evidence,fn($e)=>$e['review_status']==='approved'));
-$pending=count(array_filter($evidence,fn($e)=>in_array($e['review_status'],['pending_review','unique_ready'],true)));
+$pending=role()==='client'?0:count(array_filter($evidence,fn($e)=>in_array($e['review_status'],['pending_review','unique_ready'],true)));
 $rows=[];
 function add_row(array &$rows,string $section,string $field,string $value): void {$rows[]=[$section,$field,$value];}
 add_row($rows,'Project','Name',$p['title']);
@@ -21,21 +23,30 @@ add_row($rows,'Project','Category',$p['category']);
 add_row($rows,'Project','Description',$p['description']);
 add_row($rows,'Project','Status',status_text($p['status']));
 add_row($rows,'Project','Period',($p['start_date']?:'Not set').' to '.($p['end_date']?:'Not set'));
-add_row($rows,'Summary','Project completion',(int)$p['progress'].'%');
+$ngo=one('SELECT name FROM ngos WHERE id=?',[$p['ngo_id']]);
+add_row($rows,'Project','NGO',$ngo['name']??'Unassigned');
+add_row($rows,'Summary','Manager-confirmed project completion',number_format((float)$p['progress'],2).'%');
+add_row($rows,'Finance','Approved budget (NGN)',number_format((float)$financial['budget_total'],2));
+add_row($rows,'Finance','Funding received (NGN)',number_format((float)$financial['funding'],2));
+add_row($rows,'Finance','Recorded expenditure (NGN)',number_format((float)$financial['expenses'],2));
+add_row($rows,'Finance','Remaining budget (NGN)',number_format((float)$financial['remaining'],2));
+add_row($rows,'Finance','Cash balance (NGN)',number_format((float)$financial['cash_balance'],2));
+add_row($rows,'Finance','Budget utilisation',number_format((float)$financial['utilization'],1).'%');
 add_row($rows,'Summary','Activities',strval(count($activities)));
 add_row($rows,'Summary','Approved images',strval($approved));
-add_row($rows,'Summary','Awaiting review',strval($pending));
+if(role()!=='client')add_row($rows,'Summary','Awaiting review',strval($pending));
 if($type==='full' || $type==='audit') {
     if($type==='full') foreach($activities as $a) {
-        add_row($rows,'Activity #'.$a['id'],$a['title'],(int)$a['progress_percent'].'% complete; target: '.$a['target_description']);
+        add_row($rows,'Activity #'.$a['id'],$a['title'],number_format((float)$a['weight_percent'],2).'% of project; status: '.(role()==='client' && $a['approval_status']!=='approved'?'Not confirmed':activity_status($a['approval_status'])).'; duration: '.(int)$a['duration_days'].' days; planned: '.($a['start_date']?:'not set').' – '.($a['end_date']?:'not set').'; target: '.$a['target_description']);
     }
+    foreach($transactions as $txn) add_row($rows,'Financial ledger #'.$txn['id'],ucfirst($txn['entry_type']).' — '.$txn['entry_date'],$txn['description'].'; reference: '.($txn['reference']?:'none').'; NGN '.number_format((float)$txn['amount'],2));
     foreach($evidence as $ev) {
         $value='Date: '.$ev['evidence_date'].'; activity: '.$ev['activity_name'].'; review: '.status_text($ev['review_status']);
         if($ai) $value.='; max image similarity: '.number_format((float)$ev['max_similarity'],2).'%; matched submission: '.($ev['matched_evidence_id']?:'none');
         if($ev['review_note']) $value.='; review note: '.$ev['review_note'];
         add_row($rows,'Evidence #'.$ev['id'],$ev['original_name'],$value);
     }
-    if(me()['role']==='manager') {
+    if(in_array(role(),['manager','super_admin'],true)) {
       $audits=all('SELECT ae.*,u.full_name FROM audit_events ae JOIN users u ON u.id=ae.user_id WHERE ae.project_id=? ORDER BY ae.id DESC LIMIT 150',[$pid]);
       foreach($audits as $a) add_row($rows,'Audit event',$a['action'],$a['created_at'].' · '.$a['full_name'].' · '.$a['details']);
     }

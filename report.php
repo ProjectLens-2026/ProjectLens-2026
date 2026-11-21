@@ -2,6 +2,7 @@
 declare(strict_types=1);
 require_once __DIR__.'/inc/core.php';
 auth(['super_admin','manager','client']);
+if(!activity_budget_ready()){http_response_code(503);exit('The Super Admin must apply the database upgrade first.');}
 if($_SERVER['REQUEST_METHOD']!=='POST') {http_response_code(405);exit('Use report export on your dashboard.');}
 ensure_csrf();
 $pid=(int)($_POST['project_id']??0);$p=project($pid);
@@ -37,6 +38,7 @@ add_row($rows,'Summary','Approved images',strval($approved));
 if(role()!=='client')add_row($rows,'Summary','Awaiting review',strval($pending));
 if($type==='full' || $type==='audit') {
     if($type==='full') foreach($activities as $a) {
+        add_row($rows,'Activity budget #'.$a['id'],$a['title'],($a['activity_budget']===null?'Allocation not set':'Allocated NGN '.number_format((float)$a['activity_budget'],2)).'; approved expenditure NGN '.number_format((float)activity_spent((int)$a['id']),2));
         add_row($rows,'Activity #'.$a['id'],$a['title'],number_format((float)$a['weight_percent'],2).'% of project; status: '.(role()==='client' && $a['approval_status']!=='approved'?'Not confirmed':activity_status($a['approval_status'])).'; duration: '.(int)$a['duration_days'].' days; planned: '.($a['start_date']?:'not set').' – '.($a['end_date']?:'not set').'; target: '.$a['target_description']);
     }
     foreach($transactions as $txn) add_row($rows,'Financial ledger #'.$txn['id'],ucfirst($txn['entry_type']).' — '.$txn['entry_date'],$txn['description'].'; reference: '.($txn['reference']?:'none').'; NGN '.number_format((float)$txn['amount'],2));

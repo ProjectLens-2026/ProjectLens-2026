@@ -10,7 +10,7 @@ try {
     $check=one("SELECT COUNT(*) total FROM information_schema.columns WHERE table_schema=? AND table_name='activities' AND column_name='approval_status'",[$config['database']]);
     $userNgo=one("SELECT COUNT(*) total FROM information_schema.columns WHERE table_schema=? AND table_name='users' AND column_name='ngo_id'",[$config['database']]);
     $fundingTable=one("SELECT COUNT(*) total FROM information_schema.tables WHERE table_schema=? AND table_name='project_finances'",[$config['database']]);
-    $needUpdate=(int)($check['total']??0)===0||(int)($userNgo['total']??0)===0||(int)($fundingTable['total']??0)===0;
+    $needUpdate=(int)($check['total']??0)===0||(int)($userNgo['total']??0)===0||(int)($fundingTable['total']??0)===0||!activity_budget_ready();
 } catch(Throwable $ex) {$ready=false;}
 $canSetup=($accounts===0)||($owners===0&&me()&&role()==='manager')||(me()&&role()==='super_admin');
 if($_SERVER['REQUEST_METHOD']==='POST'){
@@ -48,7 +48,7 @@ echo '<section class="install-wrap"><div class="content-card narrow-card"><span 
 if($error)echo '<div class="alert alert-error">'.e($error).'</div>';
 if(!$canSetup)echo '<p>Existing installations can only be upgraded by the current Super Admin. If no owner exists yet, an existing manager can perform the initial upgrade.</p><a class="btn" href="'.url('login').'">Log in</a>';
 else {
-    echo '<form method="post" class="form-stack">'.csrf_input().'<input type="hidden" name="action" value="setup"><p>'.($ready?'Use this to add any missing roles, financial tables and NGO controls without deleting existing rows.':'Create the ProjectLens database and its tables.').'</p><button class="btn" type="submit">'.($ready?'Apply safe database upgrade':'Install database').'</button></form>';
+    echo '<form method="post" class="form-stack">'.csrf_input().'<input type="hidden" name="action" value="setup"><p>'.($ready?'Use this to add missing role, finance, NGO and activity-budget fields without deleting existing rows.':'Create the ProjectLens database and its tables.').'</p><button class="btn" type="submit">'.($ready?'Apply safe database upgrade':'Install database').'</button></form>';
     if($ready&&!$needUpdate&&$owners===0){
         echo '<div class="add-form"><h2>Create the first Super Admin</h2><p>The owner account is not available through public registration. Create it once with a strong password.</p><form method="post" class="form-stack">'.csrf_input().'<input type="hidden" name="action" value="owner"><div class="field"><label>Full name</label><input name="full_name" maxlength="140" required></div><div class="field"><label>Email address</label><input name="email" type="email" maxlength="190" required></div><div class="field"><label>Password (12 characters minimum)</label><input name="password" type="password" minlength="12" required></div><div class="field"><label>Confirm password</label><input name="confirm_password" type="password" minlength="12" required></div><button class="btn">Create owner account</button></form></div>';
     } elseif($ready&&$needUpdate)echo '<div class="info-note">Apply the database upgrade before creating the owner account.</div>';

@@ -107,7 +107,9 @@ function schedule_card(array $p): string {
     return '<div class="metric-card"><span>Expected progress from dates</span><strong>'.number_format($expected,2).'%</strong>'.progress_bar((int)$expected).'<small>'.e($status).'. Actual progress uses manager-approved activity weights, not dates or images.</small></div>';
 }
 function pending_expense_total(int $pid): float {
-    return (float)(one("SELECT COALESCE(SUM(amount),0) total FROM project_finances WHERE project_id=? AND entry_type='expense' AND approval_status='submitted'",[$pid])['total']??0);
+    $general=(float)(one("SELECT COALESCE(SUM(amount),0) total FROM project_finances WHERE project_id=? AND entry_type='expense' AND approval_status='submitted'",[$pid])['total']??0);
+    $pending=(float)(one("SELECT COALESCE(SUM(GREATEST(0,a.submitted_cost-COALESCE((SELECT SUM(f.amount) FROM project_finances f WHERE f.activity_id=a.id AND f.entry_type='expense' AND f.approval_status='approved'),0))),0) total FROM activities a WHERE a.project_id=? AND a.deleted_at IS NULL AND a.approval_status='submitted' AND a.submitted_cost IS NOT NULL",[$pid])['total']??0);
+    return $general+$pending;
 }
 function engineer_can_access_code(array $p): bool {return role()==='engineer' && ngo_id()>0 && (int)$p['ngo_id']===ngo_id();}
 function engineer_can_message(array $p,int $eid): bool {
@@ -210,3 +212,26 @@ function report_modal(): void {
  echo '<dialog id="reportDialog" class="report-dialog"><form method="post" action="report.php" class="report-form"><div class="modal-head"><div><span class="eyebrow">CUSTOM REPORT</span><h2>Generate project report</h2></div><button type="button" class="icon-close modal-close" aria-label="Close">✕</button></div>'.csrf_input().'<input name="project_id" id="reportProjectId" type="hidden"><label for="reportType">Report content</label><select id="reportType" name="report_type"><option value="summary">Progress summary</option><option value="full">Full performance detail</option><option value="audit">Evidence audit trail</option></select><label class="checkline"><input type="checkbox" name="include_ai" value="1" checked> Include visual similarity metadata</label><label for="reportFormat">File format</label><select id="reportFormat" name="format"><option value="pdf">PDF document</option><option value="docx">Word document (DOCX)</option><option value="xlsx">Excel workbook (XLSX)</option></select><div class="modal-actions"><button class="btn btn-muted modal-close" type="button">Cancel</button><button class="btn" type="submit">Generate & download</button></div></form></dialog>';
 }
 function safe_date(?string $value): string { return $value ? e($value) : 'Not set'; }
+
+function activity_budget_ready(): bool {
+    $columns=one("SELECT COUNT(*) total FROM information_schema.columns WHERE table_schema=DATABASE() AND ((table_name='activities' AND column_name IN ('deleted_at','activity_budget','submitted_cost')) OR (table_name='project_finances' AND column_name='activity_id'))");
+    $table=one("SELECT COUNT(*) total FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='activity_fund_requests'");
+    return (int)($columns['total']??0)===4 && (int)($table['total']??0)===1;
+}
+function activity_spent(int $aid): string {
+    return (string)(one("SELECT COALESCE(SUM(amount),0) total FROM project_finances WHERE activity_id=? AND entry_type='expense' AND approval_status='approved'",[$aid])['total']??'0');
+}
+function active_allocated(int $pid,int $exclude=0): string {
+    return (string)(one('SELECT COALESCE(SUM(activity_budget),0) total FROM activities WHERE project_id=? AND deleted_at IS NULL AND id<>?',[$pid,$exclude])['total']??'0');
+}
+function money_cents(string|int|float $value): int {return (int)round((float)$value*100);}
+function cents_amount(int $value): string {return sprintf('%d.%02d',intdiv($value,100),$value%100);}
+function budget_capacity(int $pid,int $exclude=0): int {
+    $project=one('SELECT budget_total FROM projects WHERE id=?',[$pid]);
+    $outside=one("SELECT COALESCE(SUM(f.amount),0) total FROM project_finances f LEFT JOIN activities a ON a.id=f.activity_id WHERE f.project_id=? AND f.entry_type='expense' AND f.approval_status='approved' AND (a.id IS NULL OR a.deleted_at IS NOT NULL)",[$pid]);
+    return money_cents($project['budget_total']??0)-money_cents(active_allocated($pid,$exclude))-money_cents($outside['total']??0);
+}
+function validate_activity_budget(int $pid,int $aid,string $budget): void {
+    if(money_cents($budget)>budget_capacity($pid,$aid))throw new RuntimeException('Allocation exceeds the available project budget. Increase the project budget or reduce other unused allocations first.');
+    if($aid && money_cents($budget)<money_cents(activity_spent($aid)))throw new RuntimeException('The allocation cannot be less than already approved activity expenditure.');
+}

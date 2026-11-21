@@ -42,6 +42,9 @@ function pl_setup_database(array $cfg): int {
     pl_add_column($pdo,'activities','deleted_at','DATETIME NULL AFTER manager_note');
     pl_add_column($pdo,'activities','deleted_by','INT UNSIGNED NULL AFTER deleted_at');
     pl_add_column($pdo,'activities','delete_reason','VARCHAR(500) NULL AFTER deleted_by');
+    pl_add_column($pdo,'activities','activity_budget','DECIMAL(15,2) NULL');
+    pl_add_column($pdo,'activities','submitted_cost','DECIMAL(15,2) NULL');
+    pl_add_column($pdo,'project_finances','activity_id','INT UNSIGNED NULL');
     $pdo->exec("INSERT INTO ngos (name,description) SELECT 'Legacy NGO','Migrated projects from the previous ProjectLens installation' WHERE NOT EXISTS (SELECT 1 FROM ngos WHERE name='Legacy NGO')");
     $legacy=(int)$pdo->query("SELECT id FROM ngos WHERE name='Legacy NGO' LIMIT 1")->fetchColumn();
     $stmt=$pdo->prepare("UPDATE users SET ngo_id=? WHERE role IN ('manager','engineer') AND ngo_id IS NULL");$stmt->execute([$legacy]);

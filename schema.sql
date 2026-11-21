@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS activities (
  title VARCHAR(190) NOT NULL,
  target_description VARCHAR(255) NOT NULL,
  progress_percent TINYINT UNSIGNED NOT NULL DEFAULT 0,
+ activity_budget DECIMAL(15,2) DEFAULT NULL,
+ submitted_cost DECIMAL(15,2) DEFAULT NULL,
  weight_percent DECIMAL(5,2) NOT NULL DEFAULT 0,
  duration_days INT UNSIGNED NOT NULL DEFAULT 1,
  start_date DATE DEFAULT NULL,
@@ -175,6 +177,7 @@ CREATE TABLE IF NOT EXISTS project_finances (
  id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
  project_id INT UNSIGNED NOT NULL,
  entered_by INT UNSIGNED NOT NULL,
+ activity_id INT UNSIGNED DEFAULT NULL,
  entry_type ENUM('funding','expense') NOT NULL,
  approval_status ENUM('submitted','approved','rejected') NOT NULL DEFAULT 'approved',
  reviewed_by INT UNSIGNED DEFAULT NULL,
@@ -225,4 +228,19 @@ CREATE TABLE IF NOT EXISTS support_tickets (
  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
  INDEX idx_ticket_status(status,created_at),
  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS activity_fund_requests (
+ id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+ activity_id INT UNSIGNED NOT NULL,
+ requested_by INT UNSIGNED NOT NULL,
+ requested_amount DECIMAL(15,2) NOT NULL,
+ reason VARCHAR(1000) NOT NULL,
+ status ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
+ approved_amount DECIMAL(15,2) DEFAULT NULL,
+ reviewed_by INT UNSIGNED DEFAULT NULL,
+ reviewed_at DATETIME DEFAULT NULL,
+ review_note VARCHAR(1000) DEFAULT NULL,
+ created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ INDEX idx_fund_activity (activity_id,status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

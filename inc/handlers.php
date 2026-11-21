@@ -87,8 +87,11 @@ function handle_action(string $action): never {
                 if($pid) {
                     $p=need_project($pid);if(!can_manage_project($p))throw new RuntimeException('Only the assigned project manager can edit this project.');
                     if($status==='completed'&&(float)$p['progress']<99.999)throw new RuntimeException('A project cannot be marked complete until its confirmed activity weights total 100%.');
+                    db()->beginTransaction();
+                    $locked=one('SELECT budget_total FROM projects WHERE id=? FOR UPDATE',[$pid]);
+                    if(money_cents($budget)<money_cents($locked['budget_total'])-budget_capacity($pid))throw new RuntimeException('Project budget cannot be lower than existing activity allocations and approved general expenses.');
                     query('UPDATE projects SET title=?,description=?,location=?,category=?,status=?,start_date=?,end_date=?,budget_total=? WHERE id=?',[$title,$desc,$loc,$cat,$status,$start?:null,$end?:null,$budget,$pid]);
-                    audit('project_updated','Project details and budget updated',$pid);flash('Project updated.');
+                    audit('project_updated','Project details and budget updated',$pid);db()->commit();flash('Project updated.');
                 } else {
                     if($status==='completed')throw new RuntimeException('Add and confirm activities before marking a new project complete.');
                     $created=false;
@@ -129,6 +132,7 @@ function handle_action(string $action): never {
                     if(role()==='manager'&&$activity['approval_status']==='approved')throw new RuntimeException('Reopen this confirmed activity before deleting it, or ask the Super Admin to correct it.');
                     $changed=query('UPDATE activities SET deleted_at=NOW(),deleted_by=?,delete_reason=? WHERE id=? AND project_id=? AND deleted_at IS NULL',[uid(),$reason,$aid,$pid]);
                     if($changed->rowCount()!==1)throw new RuntimeException('Activity changed before the deletion. Refresh and retry.');
+                    query("UPDATE activity_fund_requests SET status='rejected',reviewed_by=?,reviewed_at=NOW(),review_note=? WHERE activity_id=? AND status='pending'",[uid(),'Activity deleted',$aid]);
                     $remaining=(float)(one("SELECT COALESCE(SUM(CASE WHEN approval_status='approved' THEN weight_percent ELSE 0 END),0) progress FROM activities WHERE project_id=? AND deleted_at IS NULL",[$pid])['progress']??0);
                     if($remaining<99.999)query("UPDATE projects SET status='on_track' WHERE id=? AND status='completed'",[$pid]);
                     log_activity($aid,$pid,'archived','Activity deleted: '.$activity['title'].'; weight '.number_format((float)$activity['weight_percent'],2).'%; reason: '.$reason);
@@ -153,6 +157,7 @@ function handle_action(string $action): never {
                     if(!$activity)throw new RuntimeException('The activity has already been restored.');
                     $weight=(float)(one('SELECT COALESCE(SUM(weight_percent),0) total FROM activities WHERE project_id=? AND deleted_at IS NULL',[$pid])['total']??0);
                     if($weight+(float)$activity['weight_percent']>100.001)throw new RuntimeException('Restoring this activity would exceed the project weight limit of 100%. Reduce existing weights first.');
+                    if($activity['activity_budget']!==null && money_cents($activity['activity_budget'])>budget_capacity($pid,$aid)+money_cents(activity_spent($aid)))throw new RuntimeException('Restoring the activity would exceed the available project budget.');
                     $changed=query("UPDATE activities SET deleted_at=NULL,deleted_by=NULL,delete_reason=NULL,approval_status='pending',progress_percent=0,submitted_by=NULL,submitted_at=NULL,confirmed_by=NULL,confirmed_at=NULL,manager_note=? WHERE id=? AND project_id=? AND deleted_at IS NOT NULL",['Restored by Super Admin: '.$reason,$aid,$pid]);
                     if($changed->rowCount()!==1)throw new RuntimeException('Activity changed before restoration. Refresh and retry.');
                     log_activity($aid,$pid,'restored','Activity restored for new approval: '.$activity['title'].'; reason: '.$reason);
@@ -163,7 +168,7 @@ function handle_action(string $action): never {
             case 'activity_save':
                 auth('manager');$pid=(int)($_POST['project_id']??0);$p=need_project($pid);if(!can_manage_project($p))throw new RuntimeException('Not your project.');
                 $aid=(int)($_POST['activity_id']??0);$title=posted_text('title',190);$target=posted_text('target_description',255);
-                $weight=(float)decimal_amount(posted_text('weight_percent',12),false);$days=filter_var($_POST['duration_days']??null,FILTER_VALIDATE_INT);$start=posted_text('activity_start',12);
+                $allocation=decimal_amount(posted_text('activity_budget',30));$weight=(float)decimal_amount(posted_text('weight_percent',12),false);$days=filter_var($_POST['duration_days']??null,FILTER_VALIDATE_INT);$start=posted_text('activity_start',12);
                 if(!$title||!$target||$weight>100||$days===false||$days<1||$days>36500||($start&&!valid_date($start)))throw new RuntimeException('Set a title, target, weight (0.01–100%), duration (1–36500 days), and valid start date.');
                 $end=$start?(new DateTimeImmutable($start))->modify('+'.($days-1).' days')->format('Y-m-d'):null;
                 db()->beginTransaction();
@@ -171,49 +176,111 @@ function handle_action(string $action): never {
                     one('SELECT id FROM projects WHERE id=? FOR UPDATE',[$pid]);
                     $other=one('SELECT COALESCE(SUM(weight_percent),0) total FROM activities WHERE project_id=? AND deleted_at IS NULL AND id<>?',[$pid,$aid]);
                     if((float)$other['total']+$weight>100.001)throw new RuntimeException('Activity weights cannot exceed 100% of the project. Available weight: '.number_format(max(0,100-(float)$other['total']),2).'%');
+                    validate_activity_budget($pid,$aid,$allocation);
                     if($aid) {
                         $act=one('SELECT * FROM activities WHERE id=? AND project_id=? AND deleted_at IS NULL',[$aid,$pid]);if(!$act)throw new RuntimeException('Activity not found.');
                         if($act['approval_status']==='approved')throw new RuntimeException('Reopen this activity before editing an approved item.');
-                        query('UPDATE activities SET title=?,target_description=?,weight_percent=?,duration_days=?,start_date=?,end_date=? WHERE id=?',[$title,$target,$weight,$days,$start?:null,$end,$aid]);
-                        log_activity($aid,$pid,'edited','Details, weight and duration changed');
+                        if($act['submitted_cost']!==null && $act['approval_status']==='submitted' && money_cents($allocation)<money_cents($act['submitted_cost']))throw new RuntimeException('Return the submitted activity before reducing its budget below the reported cost.');
+                        query('UPDATE activities SET title=?,target_description=?,weight_percent=?,duration_days=?,start_date=?,end_date=?,activity_budget=? WHERE id=?',[$title,$target,$weight,$days,$start?:null,$end,$allocation,$aid]);
+                        log_activity($aid,$pid,'edited','Details, weight, duration and allocation changed from NGN '.($act['activity_budget']??'not set').' to NGN '.$allocation);
                     } else {
-                        query('INSERT INTO activities(project_id,title,target_description,progress_percent,weight_percent,duration_days,start_date,end_date,approval_status) VALUES(?,?,?,0,?,?,?,? ,\'pending\')',[$pid,$title,$target,$weight,$days,$start?:null,$end]);
-                        $aid=(int)db()->lastInsertId();log_activity($aid,$pid,'created','Activity created with weight '.$weight.'%');
+                        query('INSERT INTO activities(project_id,title,target_description,progress_percent,weight_percent,duration_days,start_date,end_date,activity_budget,approval_status) VALUES(?,?,?,0,?,?,?,?,?,\'pending\')',[$pid,$title,$target,$weight,$days,$start?:null,$end,$allocation]);
+                        $aid=(int)db()->lastInsertId();log_activity($aid,$pid,'created','Activity created with weight '.$weight.'%; allocation NGN '.$allocation);
                     }
+                    foreach(all('SELECT engineer_id FROM project_engineers WHERE project_id=?',[$pid]) as $eng)notify_user((int)$eng['engineer_id'],'Activity plan updated',$title.' — approved allocation NGN '.$allocation,url('project',['id'=>$pid]));
                     db()->commit();
                 } catch(Throwable $ex) {if(db()->inTransaction())db()->rollBack();throw $ex;}
                 flash('Activity saved. Overall progress changes only after confirmation.');go('project',['id'=>$pid]);
+            case 'activity_fund_request':
+                auth('engineer');$pid=(int)($_POST['project_id']??0);$p=need_project($pid);$aid=(int)($_POST['activity_id']??0);
+                $amount=decimal_amount(posted_text('additional_amount',30),false);$reason=posted_text('reason',1000);
+                if(strlen($reason)<5)throw new RuntimeException('Explain why additional funding is needed.');
+                db()->beginTransaction();
+                try {
+                    one('SELECT id FROM projects WHERE id=? FOR UPDATE',[$pid]);
+                    $act=one('SELECT * FROM activities WHERE id=? AND project_id=? AND deleted_at IS NULL FOR UPDATE',[$aid,$pid]);
+                    if(!$act||!in_array($act['approval_status'],['pending','rejected'],true)||$act['activity_budget']===null)throw new RuntimeException('This activity is not available for a funding request. Ask the manager to set its budget first.');
+                    if(one("SELECT id FROM activity_fund_requests WHERE activity_id=? AND status='pending'",[$aid]))throw new RuntimeException('A request is already waiting for review for this activity.');
+                    query('INSERT INTO activity_fund_requests(activity_id,requested_by,requested_amount,reason) VALUES(?,?,?,?)',[$aid,uid(),$amount,$reason]);
+                    log_activity($aid,$pid,'fund_requested','Additional NGN '.$amount.' requested');
+                    notify_user((int)$p['manager_id'],'Additional activity funds requested',$act['title'].' — NGN '.$amount,url('project',['id'=>$pid]));
+                    db()->commit();
+                }catch(Throwable $ex){if(db()->inTransaction())db()->rollBack();throw $ex;}
+                flash('Funding request sent to the Project Manager. The allocation has not changed.');go('project',['id'=>$pid]);
+            case 'activity_fund_decision':
+                auth('manager');$pid=(int)($_POST['project_id']??0);$p=need_project($pid);if(!can_manage_project($p))throw new RuntimeException('Not your project.');
+                $rid=(int)($_POST['request_id']??0);$decision=posted_text('decision',20);$note=posted_text('manager_note',1000);
+                if(!in_array($decision,['approved','rejected'],true)||($decision==='rejected'&&strlen($note)<3))throw new RuntimeException('Select a valid decision and explain any rejection.');
+                db()->beginTransaction();
+                try {
+                    one('SELECT id FROM projects WHERE id=? FOR UPDATE',[$pid]);
+                    $req=one("SELECT r.*,a.project_id,a.activity_budget,a.approval_status,a.title FROM activity_fund_requests r JOIN activities a ON a.id=r.activity_id WHERE r.id=? AND a.project_id=? AND a.deleted_at IS NULL AND r.status='pending' FOR UPDATE",[$rid,$pid]);
+                    if(!$req||!in_array($req['approval_status'],['pending','rejected'],true))throw new RuntimeException('This request is no longer available.');
+                    $aid=(int)$req['activity_id'];$approved=null;
+                    if($decision==='approved'){
+                        $approved=decimal_amount(posted_text('approved_amount',30),false);
+                        if(money_cents($approved)>money_cents($req['requested_amount']))throw new RuntimeException('The approved increase cannot exceed the requested amount.');
+                        $new=cents_amount(money_cents($req['activity_budget'])+money_cents($approved));
+                        if(money_cents($new)>999999999999999)throw new RuntimeException('Activity budget is too large.');
+                        validate_activity_budget($pid,$aid,$new);
+                        query('UPDATE activities SET activity_budget=? WHERE id=?',[$new,$aid]);
+                    }
+                    query("UPDATE activity_fund_requests SET status=?,approved_amount=?,reviewed_by=?,reviewed_at=NOW(),review_note=? WHERE id=? AND status='pending'",[$decision,$approved,uid(),$note?:null,$rid]);
+                    log_activity($aid,$pid,'fund_'.$decision,'Request #'.$rid.'; '.($approved===null?'Rejected':'Additional NGN '.$approved.'; new allocation NGN '.$new));
+                    foreach(all('SELECT engineer_id FROM project_engineers WHERE project_id=?',[$pid]) as $eng)notify_user((int)$eng['engineer_id'],'Activity funding '.$decision,$req['title'].' — '.($approved===null?'request rejected':'new allocation NGN '.$new),url('project',['id'=>$pid]));
+                    db()->commit();
+                }catch(Throwable $ex){if(db()->inTransaction())db()->rollBack();throw $ex;}
+                flash('Funding request '.$decision.'.');go('project',['id'=>$pid]);
             case 'activity_submit':
-                auth('engineer');$pid=(int)($_POST['project_id']??0);$p=need_project($pid);
-                if(!one('SELECT 1 FROM project_engineers WHERE project_id=? AND engineer_id=?',[$pid,uid()]))throw new RuntimeException('You are not assigned to this project.');
-                $aid=(int)($_POST['activity_id']??0);$act=one('SELECT * FROM activities WHERE project_id=? AND id=? AND deleted_at IS NULL',[$pid,$aid]);
-                if(!$act||$act['approval_status']==='approved')throw new RuntimeException('This activity is not available for submission.');
+                auth('engineer');$pid=(int)($_POST['project_id']??0);$p=need_project($pid);$aid=(int)($_POST['activity_id']??0);
                 if(empty($_POST['work_completed']))throw new RuntimeException('Tick the completion confirmation before submitting.');
                 $note=posted_text('engineer_note',1000);if(strlen($note)<3)throw new RuntimeException('Briefly describe the completed work.');
-                $submitStmt=query("UPDATE activities SET approval_status='submitted',submitted_by=?,submitted_at=NOW(),engineer_note=?,manager_note=NULL,progress_percent=0 WHERE id=? AND deleted_at IS NULL AND approval_status<>'approved'",[uid(),$note,$aid]);
-                if(!$submitStmt->rowCount())throw new RuntimeException('This activity was changed. Refresh the project page.');
-                log_activity($aid,$pid,'submitted',$note);
-                notify_user((int)$p['manager_id'],'Activity awaiting approval',$act['title'].' has been submitted by a site engineer.',url('project',['id'=>$pid]));
-                flash('Completion submitted. Project progress will update after the manager confirms.');go('project',['id'=>$pid]);
+                $cost=decimal_amount(posted_text('actual_cost',30));
+                db()->beginTransaction();
+                try {
+                    one('SELECT id FROM projects WHERE id=? FOR UPDATE',[$pid]);
+                    $act=one('SELECT * FROM activities WHERE project_id=? AND id=? AND deleted_at IS NULL FOR UPDATE',[$pid,$aid]);
+                    if(!$act||!in_array($act['approval_status'],['pending','rejected'],true))throw new RuntimeException('This activity is not available for submission.');
+                    if($act['activity_budget']===null)throw new RuntimeException('Ask the manager to allocate an activity budget first.');
+                    if(one("SELECT id FROM activity_fund_requests WHERE activity_id=? AND status='pending'",[$aid]))throw new RuntimeException('The manager must resolve the pending funding request before completion can be submitted.');
+                    if(money_cents($cost)>money_cents($act['activity_budget']))throw new RuntimeException('The reported cost exceeds the approved activity budget. Request additional funds first.');
+                    if(money_cents($cost)<money_cents(activity_spent($aid)))throw new RuntimeException('The total cannot be below previously approved expenditure. Ask the Super Admin for a financial correction.');
+                    query("UPDATE activities SET approval_status='submitted',submitted_by=?,submitted_at=NOW(),engineer_note=?,submitted_cost=?,manager_note=NULL,progress_percent=0 WHERE id=?",[uid(),$note,$cost,$aid]);
+                    log_activity($aid,$pid,'submitted','Completion and total expenditure NGN '.$cost.' submitted');
+                    notify_user((int)$p['manager_id'],'Activity and expense awaiting approval',$act['title'].' — reported total NGN '.$cost,url('project',['id'=>$pid]));
+                    db()->commit();
+                }catch(Throwable $ex){if(db()->inTransaction())db()->rollBack();throw $ex;}
+                flash('Completion and total expenditure submitted together for manager review.');go('project',['id'=>$pid]);
             case 'activity_decision':
                 auth('manager');$pid=(int)($_POST['project_id']??0);$p=need_project($pid);if(!can_manage_project($p))throw new RuntimeException('Not your project.');
-                $aid=(int)($_POST['activity_id']??0);$act=one('SELECT * FROM activities WHERE id=? AND project_id=? AND deleted_at IS NULL',[$aid,$pid]);
-                $decision=posted_text('decision',20);$note=posted_text('manager_note',1000);
-                if(!$act||!in_array($decision,['approved','rejected','reopened'],true))throw new RuntimeException('Invalid activity decision.');
-                if($decision==='reopened'&&$act['approval_status']!=='approved')throw new RuntimeException('Only approved activities can be reopened.');
-                if($decision==='rejected'&&$act['approval_status']!=='submitted')throw new RuntimeException('Only submitted activities can be rejected.');
-                if($decision==='approved'&&$act['approval_status']!=='submitted')throw new RuntimeException('Only site engineer submissions can be approved.');
-                if($decision==='approved' && (int)(one("SELECT COUNT(*) total FROM evidence WHERE project_id=? AND activity_id=? AND review_status='approved'",[$pid,$aid])['total']??0)<1)throw new RuntimeException('Review and approve at least one site photograph for this activity before confirming work.');
-                if(in_array($decision,['rejected','reopened'],true)&&strlen($note)<3)throw new RuntimeException('Explain the reason for returning or reopening the activity.');
-                $state=$decision==='reopened'?'pending':$decision;
-                $decisionStmt=query('UPDATE activities SET approval_status=?,progress_percent=?,confirmed_by=?,confirmed_at=?,manager_note=? WHERE id=? AND deleted_at IS NULL AND approval_status=?',[$state,$state==='approved'?100:0,$state==='approved'?uid():null,$state==='approved'?date('Y-m-d H:i:s'):null,$note?:null,$aid,$act['approval_status']]);
-                if(!$decisionStmt->rowCount())throw new RuntimeException('The activity changed before this decision. Please refresh.');
-                $confirmed=one("SELECT COALESCE(SUM(CASE WHEN approval_status='approved' THEN weight_percent ELSE 0 END),0) AS completed FROM activities WHERE project_id=? AND deleted_at IS NULL",[$pid]);
-                if((float)$confirmed['completed']>=99.999)query("UPDATE projects SET status='completed' WHERE id=?",[$pid]);
-                else query("UPDATE projects SET status='on_track' WHERE id=? AND status='completed'",[$pid]);
-                log_activity($aid,$pid,$decision,$note?:$decision);
-                if($act['submitted_by'])notify_user((int)$act['submitted_by'],'Activity '.$decision,$act['title'].' was '.$decision.' by the project manager.',url('project',['id'=>$pid]));
-                flash($decision==='approved'?'Activity confirmed. Project completion has been recalculated.':'Activity returned to an unconfirmed status.');go('project',['id'=>$pid]);
+                $aid=(int)($_POST['activity_id']??0);$decision=posted_text('decision',20);$note=posted_text('manager_note',1000);
+                db()->beginTransaction();
+                try {
+                    one('SELECT id FROM projects WHERE id=? FOR UPDATE',[$pid]);
+                    $act=one('SELECT * FROM activities WHERE id=? AND project_id=? AND deleted_at IS NULL FOR UPDATE',[$aid,$pid]);
+                    if(!$act||!in_array($decision,['approved','rejected','reopened'],true))throw new RuntimeException('Invalid activity decision.');
+                    if($decision==='reopened'&&$act['approval_status']!=='approved')throw new RuntimeException('Only approved activities can be reopened.');
+                    if($decision!=='reopened'&&$act['approval_status']!=='submitted')throw new RuntimeException('Only submitted activities can be reviewed.');
+                    if(in_array($decision,['rejected','reopened'],true)&&strlen($note)<3)throw new RuntimeException('Explain the reason for returning or reopening the activity.');
+                    if($decision==='approved'){
+                        if($act['activity_budget']===null||$act['submitted_cost']===null)throw new RuntimeException('Return this earlier submission for correction. Set a budget and ask the engineer to report its total cost.');
+                        if((int)(one("SELECT COUNT(*) total FROM evidence WHERE project_id=? AND activity_id=? AND review_status='approved'",[$pid,$aid])['total']??0)<1)throw new RuntimeException('Approve at least one site photograph before confirming work.');
+                        $total=money_cents($act['submitted_cost']);$prior=money_cents(activity_spent($aid));$delta=$total-$prior;
+                        if($delta<0||$total>money_cents($act['activity_budget']))throw new RuntimeException('The expenditure does not match the approved allocation or prior expense records.');
+                        $fin=project_finance($pid);
+                        if($delta>0&&money_cents($fin['expenses'])+$delta>money_cents($fin['budget_total']))throw new RuntimeException('This expense exceeds the remaining project budget. Increase the project budget first.');
+                        if($delta>0)query("INSERT INTO project_finances(project_id,activity_id,entered_by,entry_type,amount,entry_date,description,approval_status,reviewed_by,reviewed_at,manager_note) VALUES(?,?,?,'expense',?,CURDATE(),?,'approved',?,NOW(),?)",[$pid,$aid,(int)$act['submitted_by'],cents_amount($delta),'Activity #'.$aid.' — confirmed expenditure',uid(),$note?:null]);
+                    }
+                    $state=$decision==='reopened'?'pending':$decision;
+                    query('UPDATE activities SET approval_status=?,progress_percent=?,confirmed_by=?,confirmed_at=?,manager_note=? WHERE id=?',[$state,$state==='approved'?100:0,$state==='approved'?uid():null,$state==='approved'?date('Y-m-d H:i:s'):null,$note?:null,$aid]);
+                    $confirmed=one("SELECT COALESCE(SUM(weight_percent),0) completed FROM activities WHERE project_id=? AND deleted_at IS NULL AND approval_status='approved'",[$pid]);
+                    if((float)$confirmed['completed']>=99.999)query("UPDATE projects SET status='completed' WHERE id=?",[$pid]);else query("UPDATE projects SET status='on_track' WHERE id=? AND status='completed'",[$pid]);
+                    log_activity($aid,$pid,$decision,$decision==='approved'?'Work and expenditure confirmed; additional ledger expense NGN '.cents_amount($delta):$note);
+                    if($act['submitted_by'])notify_user((int)$act['submitted_by'],'Activity '.$decision,$act['title'].' was '.$decision.' by the Project Manager.',url('project',['id'=>$pid]));
+                    if($decision==='approved')foreach(all('SELECT client_id FROM project_clients WHERE project_id=?',[$pid]) as $c)notify_user((int)$c['client_id'],'Confirmed progress and financial update',$act['title'].' has been confirmed.',url('project',['id'=>$pid]));
+                    db()->commit();
+                }catch(Throwable $ex){if(db()->inTransaction())db()->rollBack();throw $ex;}
+                flash($decision==='approved'?'Activity and expenditure confirmed. Project totals updated.':'Activity returned to an unconfirmed status. Previous approved expenses remain recorded.');go('project',['id'=>$pid]);
             case 'engineer_join':
                 auth('engineer');$code=strtoupper(posted_text('project_code',6));
                 if(!preg_match('/^[A-HJ-NP-Z2-9]{6}$/',$code))throw new RuntimeException('Invalid project code.');
@@ -238,21 +305,25 @@ function handle_action(string $action): never {
                 $fid=(int)($_POST['finance_id']??0);$decision=posted_text('decision',20);$note=posted_text('manager_note',1000);
                 if(!in_array($decision,['approved','rejected'],true))throw new RuntimeException('Invalid decision.');
                 if($decision==='rejected'&&strlen($note)<3)throw new RuntimeException('A rejection reason is required.');
-                $expense=one("SELECT * FROM project_finances WHERE id=? AND project_id=? AND entry_type='expense' AND approval_status='submitted'",[$fid,$pid]);
+                db()->beginTransaction();one('SELECT id FROM projects WHERE id=? FOR UPDATE',[$pid]);
+                $expense=one("SELECT * FROM project_finances WHERE id=? AND project_id=? AND entry_type='expense' AND activity_id IS NULL AND approval_status='submitted' FOR UPDATE",[$fid,$pid]);
                 if(!$expense)throw new RuntimeException('This expense is no longer awaiting review.');
+                if($decision==='approved'&&money_cents($expense['amount'])>budget_capacity($pid))throw new RuntimeException('This general expense exceeds the unallocated project budget. Adjust allocations or increase the project budget first.');
                 query("UPDATE project_finances SET approval_status=?,reviewed_by=?,reviewed_at=NOW(),manager_note=? WHERE id=? AND approval_status='submitted'",[$decision,uid(),$note?:null,$fid]);
                 audit('expense_'.$decision,'Finance entry #'.$fid.' '.$note,$pid);
                 notify_user((int)$expense['entered_by'],'Expense '.$decision,'Your site expense has been '.$decision.'.',url('project',['id'=>$pid]));
                 if($decision==='approved')foreach(all('SELECT client_id FROM project_clients WHERE project_id=?',[$pid]) as $c)notify_user((int)$c['client_id'],'Approved financial update','An expense has been approved for '.$pr['title'].'.',url('project',['id'=>$pid]));
-                flash('Expense '.$decision.'.');go('project',['id'=>$pid]);
+                db()->commit();flash('Expense '.$decision.'.');go('project',['id'=>$pid]);
             case 'finance_add':
                 auth('manager');$pid=(int)($_POST['project_id']??0);$p=need_project($pid);if(!can_manage_project($p))throw new RuntimeException('Not your project.');
                 $type=posted_text('entry_type',20);$amount=decimal_amount(posted_text('amount',30),false);$date=posted_text('entry_date',12);$desc=posted_text('description',255);$ref=posted_text('reference',100);
                 if(!in_array($type,['funding','expense'],true)||!valid_date($date)||strlen($desc)<3)throw new RuntimeException('Enter a valid transaction type, date and description.');
+                db()->beginTransaction();one('SELECT id FROM projects WHERE id=? FOR UPDATE',[$pid]);
+                if($type==='expense'&&money_cents($amount)>budget_capacity($pid))throw new RuntimeException('General expenditure exceeds the unallocated project budget.');
                 query("INSERT INTO project_finances(project_id,entered_by,entry_type,amount,entry_date,description,reference,approval_status,reviewed_by,reviewed_at) VALUES(?,?,?,?,?,?,?,'approved',?,NOW())",[$pid,uid(),$type,$amount,$date,$desc,$ref?:null,uid()]);
                 audit('finance_'.$type,$amount.' NGN; '.$desc,$pid);
                 foreach(all('SELECT client_id FROM project_clients WHERE project_id=?',[$pid]) as $c)notify_user((int)$c['client_id'],'Project financial update',ucfirst($type).' recorded for '.$p['title'].'.',url('project',['id'=>$pid]));
-                flash('Financial entry saved and reflected in the project dashboard.');go('project',['id'=>$pid]);
+                db()->commit();flash('Financial entry saved and reflected in the project dashboard.');go('project',['id'=>$pid]);
             case 'client_join':
                 auth('client');$code=strtoupper(posted_text('project_code',6));
                 if(!preg_match('/^[A-HJ-NP-Z2-9]{6}$/',$code))throw new RuntimeException('Enter a valid six-character project code.');
@@ -365,16 +436,19 @@ function handle_action(string $action): never {
                 auth('super_admin');$pid=(int)($_POST['project_id']??0);$pr=need_project($pid);
                 $budget=decimal_amount(posted_text('budget_total',30));$reason=posted_text('reason',500);
                 if(strlen($reason)<5)throw new RuntimeException('Explain the budget correction.');
+                db()->beginTransaction();$locked=one('SELECT budget_total FROM projects WHERE id=? FOR UPDATE',[$pid]);
+                if(money_cents($budget)<money_cents($locked['budget_total'])-budget_capacity($pid))throw new RuntimeException('Project budget cannot be lower than existing activity allocations and approved general expenses.');
                 query('UPDATE projects SET budget_total=? WHERE id=?',[$budget,$pid]);
                 audit('budget_corrected','Budget changed from NGN '.$pr['budget_total'].' to NGN '.$budget.'; '.$reason,$pid);
                 notify_user((int)$pr['manager_id'],'Owner adjusted budget','Budget for '.$pr['title'].' was corrected.',url('project',['id'=>$pid]));
-                flash('Budget corrected with an audit record.');go('admin-oversight');
+                db()->commit();flash('Budget corrected with an audit record.');go('admin-oversight');
             case 'admin_activity_fix':
                 auth('super_admin');$pid=(int)($_POST['project_id']??0);$pr=need_project($pid);
                 $aid=(int)($_POST['activity_id']??0);$decision=posted_text('new_status',20);$reason=posted_text('reason',500);
                 if(strlen($reason)<5||!in_array($decision,['pending','approved'],true))throw new RuntimeException('Provide a valid correction and reason.');
                 $activity=one('SELECT id,title,approval_status FROM activities WHERE id=? AND project_id=? AND deleted_at IS NULL',[$aid,$pid]);
                 if(!$activity)throw new RuntimeException('Activity not found.');
+                if($decision==='approved'&&$activity['approval_status']!=='approved')throw new RuntimeException('Use the Project Manager completion and expenditure review to approve new work. Owner corrections can reopen an activity.');
                 query('UPDATE activities SET approval_status=?,progress_percent=?,confirmed_by=?,confirmed_at=?,manager_note=? WHERE id=? AND deleted_at IS NULL',[$decision,$decision==='approved'?100:0,$decision==='approved'?uid():null,$decision==='approved'?date('Y-m-d H:i:s'):null,'Owner correction: '.$reason,$aid]);
                 if($decision==='approved'){ $summary=one("SELECT COALESCE(SUM(CASE WHEN approval_status='approved' THEN weight_percent ELSE 0 END),0) total FROM activities WHERE project_id=? AND deleted_at IS NULL",[$pid]);if((float)$summary['total']>=99.999)query("UPDATE projects SET status='completed' WHERE id=?",[$pid]); }
                 else query("UPDATE projects SET status='on_track' WHERE id=? AND status='completed'",[$pid]);
@@ -402,10 +476,12 @@ function handle_action(string $action): never {
                 $type=posted_text('entry_type',20);$amount=decimal_amount(posted_text('amount',30),false);
                 $date=posted_text('entry_date',12);$desc=posted_text('description',255);$reason=posted_text('reason',500);
                 if(!in_array($type,['funding','expense'],true)||!valid_date($date)||strlen($desc)<3||strlen($reason)<5)throw new RuntimeException('Provide valid correction details and a reason.');
+                db()->beginTransaction();one('SELECT id FROM projects WHERE id=? FOR UPDATE',[$pid]);
+                if($type==='expense'&&money_cents($amount)>budget_capacity($pid))throw new RuntimeException('General expenditure exceeds the unallocated project budget. Correct the project budget or allocations first.');
                 query("INSERT INTO project_finances(project_id,entered_by,entry_type,amount,entry_date,description,reference,approval_status,reviewed_by,reviewed_at,manager_note) VALUES(?,?,?,?,?,?,?,'approved',?,NOW(),?)",[$pid,uid(),$type,$amount,$date,$desc,'OWNER-CORRECTION',uid(),$reason]);
                 audit('finance_corrected','Approved owner correction: '.$type.' NGN '.$amount.'; '.$reason,$pid);
                 notify_user((int)$pr['manager_id'],'Owner financial correction','Financial information was corrected for '.$pr['title'].'.',url('project',['id'=>$pid]));
-                flash('Correction saved and audited.');go('admin-oversight');
+                db()->commit();flash('Correction saved and audited.');go('admin-oversight');
             case 'settings_save':
                 auth();$name=posted_text('full_name',140);$org=posted_text('organization',190);
                 if(strlen($name)<2||strlen($org)<2)throw new RuntimeException('Enter a valid name and organisation.');
@@ -426,10 +502,11 @@ function handle_action(string $action): never {
             default: throw new RuntimeException('Invalid operation.');
         }
     } catch(Throwable $ex) {
+        try {if(db()->inTransaction())db()->rollBack();}catch(Throwable $ignored){}
         $msg=$ex instanceof PDOException?'Database action failed. Check XAMPP, database installation and field values.':$ex->getMessage();
         flash($msg,'error');
         $fallback=match($action) {
-            'signup'=>'register','login'=>'login','project_save'=>'projects','activity_save','activity_submit','activity_decision','engineer_assign','engineer_unassign','finance_add','client_assign','client_remove'=>'project',
+            'signup'=>'register','login'=>'login','project_save'=>'projects','activity_save','activity_submit','activity_decision','activity_fund_request','activity_fund_decision','engineer_assign','engineer_unassign','finance_add','client_assign','client_remove'=>'project',
             'admin_ngo_create','admin_account_assign','admin_account_delete','admin_account_restore'=>'admin','client_join'=>'find-project','engineer_join'=>'engineer-find','project_message_send'=>'conversation','engineer_message_send'=>'engineer-chat','evidence_decision'=>'queue','upload'=>'evidence',
             'engineer_finance_submit','finance_decision'=>'project','activity_archive'=>role()==='super_admin'?'admin-oversight':'project','activity_restore'=>'admin-oversight','admin_finance_void','admin_finance_correct','admin_transfer_project','admin_budget_adjust','admin_activity_fix','support_resolve'=>'admin-oversight','support_send'=>'support','settings_save','password_save'=>'settings','notification_read'=>'notifications','contact'=>'contact',default=>'dashboard'
         };
